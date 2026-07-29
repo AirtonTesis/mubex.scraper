@@ -1,0 +1,42 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+*.cache
+*.log
+.vs/
+*.userprefs
+*.DotSettings
+logs/
+
+# Angular
+frontend/node_modules/
+frontend/dist/
+frontend/.angular/
+frontend/npm-debug.log
+frontend/yarn-error.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+appsettings.Development.json
+appsettings.Local.json
+*.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database
+*.db
+*.sqlite
+
+# Secrets
+secrets.json
