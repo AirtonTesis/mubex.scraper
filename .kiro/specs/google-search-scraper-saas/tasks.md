@@ -434,6 +434,143 @@ A implementação segue uma abordagem incremental, construindo camadas de infrae
 - [ ] 16. Checkpoint final - Sistema pronto para uso
   - Ensure all tests pass, ask the user if questions arise.
 
+## 17. Estabilizar o fluxo de CAPTCHA e confirmação de resultados
+
+> **Escopo de segurança:** este épico não inclui técnicas para burlar CAPTCHA, spoofing de fingerprint, mascaramento de automação, rotação de proxies para evasão ou simulação de comportamento humano com esse objetivo. O foco é diagnóstico, controle de estado, encerramento seguro de loops, observabilidade e uso de fontes autorizadas.
+
+- [ ] 17.1 Definir estados explícitos do fluxo de verificação
+  - Criar um modelo de estado para separar `ChallengeDetected`, `AnswerSubmitted`, `VerificationPending`, `VerificationAccepted`, `ResultsLoaded`, `RepeatedChallenge`, `Blocked` e `Failed`.
+  - Definir transições válidas e transições terminais.
+  - Garantir que cada transição registre estado anterior, estado novo, motivo e timestamp UTC.
+  - **Critérios de aceite:** nenhuma execução pode permanecer em loop sem limite; `RepeatedChallenge` e `Blocked` devem ser estados distintos de erro técnico.
+  - **Dependências:** nenhuma.
+  - **Arquivos relacionados:** `src/Infrastructure/Scraping/ScrapingModels.cs`, `src/Infrastructure/Scraping/PlaywrightScrapingEngine.cs`.
+
+- [ ] 17.2 Criar um resultado estruturado para o ciclo de CAPTCHA
+  - Substituir o retorno booleano usado no fluxo de resolução por um resultado tipado contendo estado final, quantidade de rounds, duração, erro categorizado e evidências de navegação.
+  - Preservar a compatibilidade com `ScrapingResult` e `SearchResultData`.
+  - **Critérios de aceite:** o chamador consegue distinguir `VerificationAccepted`, `RepeatedChallenge`, `VerificationExpired`, `WebhookInvalid`, `NavigationTimeout` e `Blocked` sem interpretar texto de log.
+  - **Dependências:** 17.1.
+  - **Arquivos relacionados:** `src/Infrastructure/Scraping/ScrapingModels.cs`, `src/Infrastructure/Scraping/PlaywrightScrapingEngine.cs`.
+
+- [ ] 17.3 Separar detecção de challenge, bloqueio e resultados
+  - Refatorar `ICaptchaDetectionService` para expor responsabilidades distintas, evitando tratar a simples presença de iframe ou `div.g-recaptcha` como prova suficiente de bloqueio.
+  - Criar verificações independentes para challenge visível, página de bloqueio, resultados carregados e página legítima sem resultados.
+  - **Critérios de aceite:** a presença residual de um iframe não pode, sozinha, transformar uma página com resultados válidos em falha; cada classificação deve indicar o sinal que a motivou.
+  - **Dependências:** 17.1.
+  - **Arquivos relacionados:** `src/Infrastructure/Scraping/CaptchaDetectionService.cs`, `src/Infrastructure/Scraping/PlaywrightScrapingEngine.cs`.
+
+- [ ] 17.4 Implementar confirmação pós-verificação baseada na navegação
+  - Após a ação de verificação, aguardar e classificar o estado final usando URL, conteúdo, frame, carregamento de resultados e estado legítimo sem resultados.
+  - Não considerar apenas o desaparecimento do grid como confirmação de sucesso.
+  - **Critérios de aceite:** o sistema só classifica como `VerificationAccepted` quando a navegação posterior é consistente; se surgir outro challenge, classifica como `RepeatedChallenge`.
+  - **Dependências:** 17.2 e 17.3.
+  - **Arquivos relacionados:** `src/Infrastructure/Scraping/PlaywrightScrapingEngine.cs`, `src/Infrastructure/Scraping/CaptchaDetectionService.cs`.
+
+- [ ] 17.5 Limitar rounds, reloads e tentativas por execução
+  - Centralizar limites configuráveis para rounds de challenge, reloads, tempo total de verificação e tentativas por keyword.
+  - Definir um orçamento global por keyword e por job, contabilizando loops aninhados (`MaxRetries`, rounds e reloads) para impedir multiplicação inadvertida de tentativas.
+  - Remover caminhos que fazem retentativas indefinidas ou repetem a mesma sessão após `RepeatedChallenge`/`Blocked`.
+  - **Critérios de aceite:** ao atingir qualquer limite, o job termina com categoria determinística e não executa nova interação de UI; os limites aparecem na configuração e nos logs; o número total de tentativas nunca excede o orçamento global.
+  - **Dependências:** 17.1 e 17.2.
+  - **Arquivos relacionados:** `src/Infrastructure/Scraping/PlaywrightScrapingEngine.cs`, `src/WebApi/appsettings.json`, `src/Workers/appsettings.json`.
+
+- [ ] 17.6 Adicionar telemetria estruturada do ciclo completo
+  - Registrar, sem armazenar imagens, tokens ou credenciais: `execution_id`, `keyword`, `round`, `grid_size`, latência do webhook, quantidade de células selecionadas, clique de verificação, estado pós-verificação, URL sanitizada, quantidade de resultados e duração total.
+  - Proibir payload JSON bruto do webhook, base64 de imagens, tokens, cookies, credenciais e parâmetros sensíveis de URL nos logs de produção.
+  - Implementar redaction centralizado e teste específico para confirmar que os campos sensíveis não são emitidos.
+  - Categorizar falhas do webhook, parsing, expiração, navegação, challenge repetido e bloqueio.
+  - **Critérios de aceite:** uma execução pode ser reconstruída a partir dos logs; dados sensíveis são redigidos; métricas permitem calcular taxas por estado final; nenhum log de produção contém imagens, payloads brutos ou tokens.
+  - **Dependências:** 17.2.
+  - **Arquivos relacionados:** `src/Infrastructure/Scraping/PlaywrightScrapingEngine.cs`, `src/Infrastructure/Scraping/CaptchaDetectionService.cs`.
+
+- [ ] 17.7 Criar testes unitários para classificação e transições
+  - Testar todas as transições válidas e inválidas do modelo de estado.
+  - Testar challenge aceito com resultados, challenge aceito sem resultados, challenge repetido, bloqueio, expiração, webhook inválido e timeout.
+  - Testar que a presença de iframe residual não é suficiente para classificar uma página como bloqueada.
+  - **Critérios de aceite:** os testes são determinísticos e cobrem os critérios de aceite das tarefas 17.1 a 17.4.
+  - **Dependências:** 17.1 a 17.4.
+  - **Arquivos relacionados:** `tests/Infrastructure.Tests`, novos testes do scraper e dos serviços de detecção.
+
+- [ ] 17.8 Criar testes de integração do webhook n8n com contrato estável
+  - Usar um cliente HTTP substituível ou servidor fake para testar respostas válidas, listas com tamanho incorreto, JSON inválido, resposta vazia, HTTP 4xx/5xx e timeout.
+  - Não depender do endpoint n8n real nos testes automatizados.
+  - **Critérios de aceite:** cada falha produz uma categoria de erro específica e não gera loop silencioso.
+  - **Dependências:** 17.2 e 17.6.
+  - **Arquivos relacionados:** `src/Infrastructure/Scraping/PlaywrightScrapingEngine.cs`, `tests/Infrastructure.Tests`.
+
+- [ ] 17.9 Adicionar circuit breaker operacional para bloqueios repetidos
+  - Criar um mecanismo por domínio/ambiente que interrompa novas execuções após uma quantidade configurável de `RepeatedChallenge` ou `Blocked` em janela de tempo definida.
+  - Expor o estado do circuito nos logs e permitir reset explícito por configuração/operação.
+  - **Critérios de aceite:** com o circuito aberto, novas execuções são encerradas antes de iniciar nova interação; o motivo é visível e o circuito volta ao estado fechado conforme a política configurada.
+  - **Dependências:** 17.1, 17.5 e 17.6.
+  - **Arquivos relacionados:** `src/Infrastructure/Scraping`, `src/WebApi/appsettings.json`, `src/Workers/appsettings.json`.
+
+- [ ] 17.10 Definir política de fallback autorizado
+  - Documentar quando uma execução deve ser desviada para uma fonte autorizada de resultados, como API oficial aplicável ou provedor contratado.
+  - Definir contrato comum para mapear resultados externos para `SearchResultData`.
+  - Definir o roteamento efetivo no orquestrador: `RepeatedChallenge`/`Blocked` deve encerrar a sessão atual e, quando habilitado, acionar a engine autorizada sem iniciar novas interações de UI na mesma sessão.
+  - Registrar no resultado final qual fonte foi utilizada e se houve coleta parcial antes do fallback.
+  - **Critérios de aceite:** o job não depende de resolver repetidamente um challenge para entregar resultado; quotas, erros e indisponibilidade do provedor são tratados explicitamente; o fallback não é apenas documentado, mas acionado por uma transição testável.
+  - **Dependências:** 17.2, 17.5 e decisão do provedor.
+  - **Arquivos relacionados:** `src/Infrastructure/Scraping/IScrapingEngine.cs`, `src/Infrastructure/Scraping/ScrapingModels.cs`, `src/Infrastructure/Scraping/PlaywrightScrapingEngine.cs`.
+
+- [ ] 17.11 Implementar engine de resultados autorizado como fallback
+  - Criar uma implementação de `IScrapingEngine` para o provedor aprovado após definição de credenciais, quota, limites e termos de uso.
+  - Mapear paginação, domínio, posição, título, URL e snippet conforme o contrato disponível.
+  - **Critérios de aceite:** respostas válidas são convertidas para o modelo interno; erros de autenticação, quota e indisponibilidade produzem estados operacionais claros; credenciais não ficam no código.
+  - **Dependências:** 17.10 e escolha formal do provedor.
+  - **Arquivos relacionados:** `src/Infrastructure/Scraping`, `src/WebApi/appsettings.json`, `src/Workers/appsettings.json`.
+
+- [ ] 17.12 Persistir o resultado do ciclo de verificação
+  - Decidir e documentar quais campos serão persistidos em `Job`/`JobHistoryEntry`: estado final, categoria de erro, engine utilizada, quantidade de rounds e duração.
+  - Adicionar configurações EF, DTOs e migrations somente para dados operacionais necessários, sem imagens, tokens ou payloads sensíveis.
+  - **Critérios de aceite:** o estado exibido após reinício da API é consistente com o estado final registrado; o schema não armazena artefatos sensíveis do CAPTCHA.
+  - **Dependências:** 17.1, 17.2 e 17.6.
+  - **Arquivos relacionados:** `src/Domain/Entities/Job.cs`, `src/Domain/Entities/JobHistoryEntry.cs`, `src/Infrastructure/Persistence`, `src/WebApi/Features/Jobs`.
+
+- [ ] 17.13 Atualizar dashboard e histórico de jobs com estados de CAPTCHA
+  - Exibir estados finais e motivos sem expor detalhes sensíveis.
+  - Diferenciar falha técnica, challenge repetido, bloqueio, fallback utilizado e sucesso com/sem resultados.
+  - **Critérios de aceite:** o usuário consegue identificar por que um job não prosseguiu e qual fonte produziu os dados.
+  - **Dependências:** 17.2, 17.6, 17.10 e 17.12.
+  - **Arquivos relacionados:** `src/WebApi/Features/Jobs`, `src/WebApi/Features/Dashboard`, `frontend/src/app/features/jobs`, `frontend/src/app/features/dashboard`.
+
+- [ ] 17.14 Criar runbook de operação e critérios de parada
+  - Documentar interpretação dos estados, limites, circuit breaker, coleta de evidências, redaction de dados, procedimento de reset e acionamento do fallback.
+  - Definir que `RepeatedChallenge`/`Blocked` encerra a execução atual sem novas tentativas automáticas na mesma sessão.
+  - **Critérios de aceite:** outra pessoa consegue operar e diagnosticar o pipeline sem acessar imagens, tokens ou dados sensíveis.
+  - **Dependências:** 17.5, 17.6 e 17.9.
+  - **Arquivos relacionados:** `docs/RELATORIO-CAPTCHA-SOLVING.md`, novo runbook em `docs/`.
+
+- [ ] 17.15 Marcar tarefas legadas fora do escopo desta prioridade
+  - Revisar as tarefas 11.1 a 11.4 e 15.2 que mencionam stealth, proxy rotation, spoofing ou simulação de comportamento para evasão.
+  - Marcar essas tarefas como fora de escopo/deprecadas para este épico, evitando que o backlog misture estabilização legítima com bypass de controles anti-automação.
+  - **Critérios de aceite:** o plano de execução deixa explícito que a prioridade atual não inclui evasão; tarefas de infraestrutura que sejam necessárias por motivos legítimos permanecem separadas e justificadas.
+  - **Dependências:** nenhuma.
+  - **Arquivos relacionados:** `.kiro/specs/google-search-scraper-saas/tasks.md`, `.kiro/specs/google-search-scraper-saas/requirements.md`.
+
+- [ ] 17.16 Checkpoint - Validar o fluxo estabilizado
+  - Executar testes backend completos.
+  - Executar testes específicos de Infrastructure e WebApi.
+  - Validar build do frontend após instalação das dependências.
+  - Confirmar que o workspace não grava imagens, tokens ou credenciais em logs de produção.
+  - **Dependências:** 17.7 a 17.15.
+
+### Dependências sugeridas do épico 17
+
+```text
+17.1 ─┬─> 17.2 ─┬─> 17.4 ─┬─> 17.7
+      │         ├─> 17.6 ├─> 17.8
+      └─> 17.3 ─┘        ├─> 17.9 ─> 17.13
+                         └─> 17.10 ─> 17.11 ─> 17.12
+17.5 depende de 17.1 + 17.2
+17.12 depende de 17.1 + 17.2 + 17.6
+17.13 depende de 17.2 + 17.6 + 17.10 + 17.12
+17.14 depende de 17.5 + 17.6 + 17.9
+17.16 depende de todas as tasks anteriores
+```
+
 ## Notes
 
 - Tarefas marcadas com `*` são opcionais e podem ser puladas para um MVP mais rápido
