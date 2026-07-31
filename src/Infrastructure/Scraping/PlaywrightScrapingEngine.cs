@@ -307,7 +307,12 @@ public class PlaywrightScrapingEngine : IScrapingEngine
         // PRECISAMOS aguardar esse redirect — se verificarmos antes,
         // a URL ainda contém /sorry/ e o DetectAsync acusa falso
         // positivo, abortando antes de coletar os dados.
-        var redirectDeadline = DateTime.UtcNow.AddSeconds(15);
+        // Em desafios longos (multi-round), o reCAPTCHA demora mais para
+        // validar a resposta e redirecionar do /sorry/ de volta aos resultados
+        // — o deadline de 15s era curto demais e fazia o DetectAsync acusar
+        // CAPTCHA logo apos resolver, fechando o navegador. Agora aguardamos
+        // ate 45s.
+        var redirectDeadline = DateTime.UtcNow.AddSeconds(45);
         while (DateTime.UtcNow < redirectDeadline &&
                page.Url.Contains("/sorry/", StringComparison.OrdinalIgnoreCase))
         {
@@ -316,7 +321,7 @@ public class PlaywrightScrapingEngine : IScrapingEngine
 
         if (page.Url.Contains("/sorry/", StringComparison.OrdinalIgnoreCase))
         {
-            _logger.LogWarning("Redirecionamento do /sorry/ nao concluido em 15s — continuando mesmo assim");
+            _logger.LogWarning("Redirecionamento do /sorry/ nao concluido em 45s — continuando mesmo assim");
         }
         else
         {
@@ -895,6 +900,12 @@ public class PlaywrightScrapingEngine : IScrapingEngine
 
         [JsonPropertyName("grid")]
         public List<string> Grid { get; set; } = new();
+
+        [JsonPropertyName("siteKey")]
+        public string SiteKey { get; set; } = "";
+
+        [JsonPropertyName("pageUrl")]
+        public string PageUrl { get; set; } = "";
     }
 
     private class CaptchaWebhookResponse
@@ -1035,7 +1046,14 @@ public class PlaywrightScrapingEngine : IScrapingEngine
                 var webhookRequest = new CaptchaWebhookRequest
                 {
                     Header = headerBase64,
-                    Grid = gridBase64List
+                    Grid = gridBase64List,
+                    // Sitekey do reCAPTCHA (parametro 'k' da URL do bframe/anchor)
+                    // e URL da pagina onde o CAPTCHA apareceu, para o n8n poder
+                    // auditar / registrar de onde veio cada desafio.
+                    SiteKey = ExtractSiteKeyFromUrl(frame.Url)
+                             ?? ExtractSiteKeyFromUrl(page.Url)
+                             ?? string.Empty,
+                    PageUrl = page.Url
                 };
 
                 // Timeout de 12s APENAS para a chamada HTTP do webhook —
@@ -1258,16 +1276,62 @@ public class PlaywrightScrapingEngine : IScrapingEngine
                 return false;
             }
 
-            // 8. Aguardar resposta do Google (3-5s)
-            var postVerifyDelay = Random.Shared.Next(3000, 5000);
-            _logger.LogInformation("Aguardando {Delay}ms apos verify...", postVerifyDelay);
-            await Task.Delay(postVerifyDelay, cancellationToken);
+            // 8. Aguardar resposta do Google APOS o verify.
+            // Em desafios longos (multi-round) o Google demora mais para
+            // processar a resposta e redirecionar — o delay fixo de 3-5s fazia
+            // o grid ainda existir na checagem, o fluxo abortar e o navegador
+            // fechar logo apos resolver. Agora aguardamos ATE 20s (polling de
+            // 1s) pelo grid sumir antes de decidir.
+            var postVerifyDeadline = DateTime.UtcNow.AddSeconds(20);
+            var gridGoneAfterVerify = false;
+            var pollIteration = 0;
+            while (DateTime.UtcNow < postVerifyDeadline)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // Checar expiracao periodicamente (a cada 5 iteracoes) — evita
+                // esperar 20s sobre um desafio ja expirado. O text-eval e caro,
+                // por isso nao roda a cada segundo.
+                pollIteration++;
+                if (pollIteration % 5 == 0 && await HasChallengeExpiredAsync(page))
+                {
+                    _logger.LogWarning("CAPTCHA expirou durante espera pos-verify no round {Round}. Abortando para retentativa.", round);
+                    return false;
+                }
+
+                var checkCells = await frame.QuerySelectorAllAsync("td.rc-imageselect-tile");
+                if (checkCells.Count == 0)
+                {
+                    // Grid sumiu: pode ser transicao de rotacao de imagens
+                    // (resposta errada). Reconfirmar apos 1s antes de declarar
+                    // resolvido — evita falso positivo de "resolvido" que faria
+                    // o fluxo esperar 45s por um redirect que nao vem.
+                    await Task.Delay(1000, cancellationToken);
+                    var confirmCells = await frame.QuerySelectorAllAsync("td.rc-imageselect-tile");
+                    if (confirmCells.Count == 0)
+                    {
+                        gridGoneAfterVerify = true;
+                        break;
+                    }
+                }
+
+                await Task.Delay(1000, cancellationToken);
+            }
+
+            if (gridGoneAfterVerify)
+            {
+                _logger.LogInformation("Grid desapareceu apos verify no round {Round} - CAPTCHA resolvido!", round);
+                return true;
+            }
+
+            _logger.LogInformation("Grid ainda presente apos verify no round {Round} - aguardando 5s extras antes de assumir rotacao...", round);
+            await Task.Delay(5000, cancellationToken);
 
             // Verificar se o grid ainda existe (novas imagens = outro round)
             var newCells = await frame.QuerySelectorAllAsync("td.rc-imageselect-tile");
             if (newCells.Count == 0)
             {
-                _logger.LogInformation("Grid desapareceu apos verify no round {Round} - CAPTCHA resolvido!", round);
+                _logger.LogInformation("Grid desapareceu apos verify no round {Round} (com atraso) - CAPTCHA resolvido!", round);
                 return true;
             }
 
@@ -1350,8 +1414,11 @@ public class PlaywrightScrapingEngine : IScrapingEngine
                 {
                     await _humanClick.ClickElementHumanizedAsync(page, verifyButton, cancellationToken);
                 }
-                // Aguardar processamento do clique (2-4s)
-                var afterClickDelay = Random.Shared.Next(2000, 4000);
+                // Aguardar processamento do clique (3-6s).
+                // Em desafios longos (multi-round), o Google demora mais para
+                // processar o verify — esperar pouco fazia o grid ainda estar
+                // presente na checagem seguinte e o desafio ser abortado.
+                var afterClickDelay = Random.Shared.Next(3000, 6000);
                 await Task.Delay(afterClickDelay, cancellationToken);
                 return true;
             }
@@ -1365,6 +1432,22 @@ public class PlaywrightScrapingEngine : IScrapingEngine
             return false;
         }
     }
+    /// <summary>
+    /// Extrai o sitekey do reCAPTCHA de uma URL. O sitekey vem no parametro 'k'
+    /// (ex: https://www.google.com/recaptcha/enterprise/bframe?...&k=6LfwuyUTAAAAA...&...).
+    /// Retorna null se nao encontrar.
+    /// </summary>
+    private static string? ExtractSiteKeyFromUrl(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return null;
+
+        var match = System.Text.RegularExpressions.Regex.Match(url, "[?&]k=([^&]+)");
+        if (!match.Success) return null;
+
+        try { return Uri.UnescapeDataString(match.Groups[1].Value); }
+        catch { return match.Groups[1].Value; }
+    }
+
     /// <summary>
     /// Extrai palavras-chave relevantes da instrucao do CAPTCHA para matching.
     /// Mapeia termos em portugues e ingles (ex: "carros" -> "car", "vehicle").
