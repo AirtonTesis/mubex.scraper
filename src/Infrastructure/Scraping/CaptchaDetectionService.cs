@@ -1,4 +1,3 @@
-using System.IO;
 using Microsoft.Playwright;
 using Microsoft.Extensions.Logging;
 
@@ -16,13 +15,9 @@ public class CaptchaDetectionService : ICaptchaDetectionService
 {
     private readonly ILogger<CaptchaDetectionService> _logger;
 
-    private readonly string _screenshotDir;
-
     public CaptchaDetectionService(ILogger<CaptchaDetectionService> logger)
     {
         _logger = logger;
-        _screenshotDir = Path.Combine(AppContext.BaseDirectory, "screenshots");
-        Directory.CreateDirectory(_screenshotDir);
     }
 
     public async Task<bool> DetectAsync(IPage page, string? screenshotPrefix = null, CancellationToken cancellationToken = default)
@@ -48,7 +43,6 @@ public class CaptchaDetectionService : ICaptchaDetectionService
                 currentUrl.Contains("challenge", StringComparison.OrdinalIgnoreCase))
             {
                 _logger.LogWarning("URL de bloqueio detectada: {Url}", currentUrl);
-                await SaveScreenshotAsync(page, screenshotPrefix, "blocked_url");
                 return true;
             }
 
@@ -57,7 +51,6 @@ public class CaptchaDetectionService : ICaptchaDetectionService
             if (recaptchaDiv != null)
             {
                 _logger.LogWarning("reCAPTCHA div interativo detectado");
-                await SaveScreenshotAsync(page, screenshotPrefix, "recaptcha_div");
                 return true;
             }
 
@@ -66,7 +59,6 @@ public class CaptchaDetectionService : ICaptchaDetectionService
             if (recaptchaIframe != null)
             {
                 _logger.LogWarning("Iframe reCAPTCHA Enterprise detectado");
-                await SaveScreenshotAsync(page, screenshotPrefix, "recaptcha_iframe");
                 return true;
             }
 
@@ -80,7 +72,6 @@ public class CaptchaDetectionService : ICaptchaDetectionService
                 content.Contains("consent.google.com", StringComparison.OrdinalIgnoreCase))
             {
                 _logger.LogWarning("Mensagem de bloqueio detectada no conteúdo");
-                await SaveScreenshotAsync(page, screenshotPrefix, "blocked_content");
                 return true;
             }
 
@@ -89,7 +80,6 @@ public class CaptchaDetectionService : ICaptchaDetectionService
             if (challengeForm != null)
             {
                 _logger.LogWarning("Challenge form detectado");
-                await SaveScreenshotAsync(page, screenshotPrefix, "challenge_form");
                 return true;
             }
 
@@ -102,7 +92,6 @@ public class CaptchaDetectionService : ICaptchaDetectionService
                     title.Contains("Google", StringComparison.OrdinalIgnoreCase) && currentUrl.Contains("sorry"))
                 {
                     _logger.LogWarning("Página sem resultados com título de bloqueio: {Title}", title);
-                    await SaveScreenshotAsync(page, screenshotPrefix, "empty_results");
                     return true;
                 }
 
@@ -119,26 +108,4 @@ public class CaptchaDetectionService : ICaptchaDetectionService
         }
     }
 
-    private async Task SaveScreenshotAsync(IPage page, string? prefix, string reason)
-    {
-        try
-        {
-            var safePrefix = string.Join("_", (prefix ?? "captcha").Split(Path.GetInvalidFileNameChars()));
-            var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-            var filename = $"{safePrefix}_{reason}_{timestamp}.png";
-            var filePath = Path.Combine(_screenshotDir, filename);
-
-            await page.ScreenshotAsync(new PageScreenshotOptions
-            {
-                Path = filePath,
-                FullPage = true
-            });
-
-            _logger.LogWarning("Screenshot salvo: {FilePath}", filePath);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Falha ao salvar screenshot do CAPTCHA");
-        }
-    }
 }

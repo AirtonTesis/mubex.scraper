@@ -2,8 +2,8 @@ import { Component, OnInit, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ApiService } from '../../core/api/api.service';
-import { interval, Subscription } from 'rxjs';
-import { switchMap } from 'rxjs/operators';
+import { interval, Subscription, of } from 'rxjs';
+import { switchMap, catchError } from 'rxjs/operators';
 
 export interface SearchList {
   id: string;
@@ -133,11 +133,20 @@ export interface SearchList {
 
           <!-- Actions -->
           <div class="list-actions">
-            <button (click)="enqueueJob(list)" class="btn-run"
-                    [disabled]="list.latestJobStatus === 'Active' || list.latestJobStatus === 'Pending' || enqueueingId === list.id">
-              <span *ngIf="enqueueingId !== list.id">▶ Executar</span>
-              <span *ngIf="enqueueingId === list.id" class="spinner"></span>
-            </button>
+            <!-- Botao dinamico: Executar / Parar -->
+            <ng-container *ngIf="list.latestJobStatus === 'Active' || list.latestJobStatus === 'Pending'">
+              <button (click)="pauseJob(list)" class="btn-stop" [disabled]="stoppingId === list.id">
+                <span *ngIf="stoppingId !== list.id">⏹ Parar</span>
+                <span *ngIf="stoppingId === list.id" class="spinner"></span>
+              </button>
+            </ng-container>
+            <ng-container *ngIf="list.latestJobStatus !== 'Active' && list.latestJobStatus !== 'Pending'">
+              <button (click)="enqueueJob(list)" class="btn-run"
+                      [disabled]="enqueueingId === list.id">
+                <span *ngIf="enqueueingId !== list.id">▶ Executar</span>
+                <span *ngIf="enqueueingId === list.id" class="spinner"></span>
+              </button>
+            </ng-container>
             <button (click)="editSearchList(list)" class="btn-secondary">Editar</button>
             <button (click)="deleteSearchList(list.id)" class="btn-danger">Excluir</button>
           </div>
@@ -257,6 +266,23 @@ export interface SearchList {
     }
     .btn-run:hover:not(:disabled) { background: rgba(16, 185, 129, 0.4); transform: translateY(-1px); }
     .btn-run:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .btn-stop {
+      padding: 0.6rem 1.2rem;
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.9rem;
+      transition: all 0.2s;
+      background: rgba(239, 68, 68, 0.2);
+      color: #fca5a5;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .btn-stop:hover:not(:disabled) { background: rgba(239, 68, 68, 0.4); transform: translateY(-1px); }
+    .btn-stop:disabled { opacity: 0.4; cursor: not-allowed; }
 
     .lists-grid {
       display: grid;
@@ -477,6 +503,7 @@ export class SearchListsComponent implements OnInit, OnDestroy {
   keywordsText = '';
   domainsText = '';
   enqueueingId: string | null = null;
+  stoppingId: string | null = null;
   toastMessage = '';
   toastType: 'success' | 'error' = 'success';
 
@@ -487,11 +514,36 @@ export class SearchListsComponent implements OnInit, OnDestroy {
   ngOnInit(): void {
     this.loadSearchLists();
     // Polling a cada 3 segundos para atualizar status dos jobs
+    // O catchError DENTRO do switchMap evita que a assinatura do
+    // interval(3000) morra quando a API estiver offline.
     this.pollSub = interval(3000).pipe(
-      switchMap(() => this.api.get<SearchList[]>('/searchlists'))
+      switchMap(() => this.api.get<SearchList[]>('/searchlists').pipe(
+        catchError(err => {
+          console.error('Erro no polling de listas:', err);
+          // API offline — resetar enqueueingId e stoppingId (requests que
+          // podem estar travados) E os status Active/Pending (nao podem
+          // estar rodando se API caiu).
+          this.enqueueingId = null;
+          this.stoppingId = null;
+          this.searchLists.forEach(sl => {
+            if (sl.latestJobStatus === 'Active' || sl.latestJobStatus === 'Pending') {
+              sl.latestJobStatus = null;
+              sl.latestJobId = null;
+              sl.latestJobCreatedAt = null;
+            }
+          });
+          return of(null);  // sinaliza "sem dados" sem quebrar o polling
+        })
+      ))
     ).subscribe({
-      next: data => this.searchLists = data,
-      error: err => console.error('Erro no polling de listas:', err)
+      next: data => {
+        if (data !== null) {
+          this.searchLists = data;
+        }
+      },
+      error: err => {
+        console.error('Erro fatal no polling:', err);
+      }
     });
   }
 
@@ -592,6 +644,26 @@ export class SearchListsComponent implements OnInit, OnDestroy {
       error: (err) => {
         this.enqueueingId = null;
         this.showToast('Erro ao enfileirar job: ' + (err.error?.title || err.message), 'error');
+      }
+    });
+  }
+
+  pauseJob(list: SearchList): void {
+    if (!list.latestJobId) {
+      this.showToast('Nenhum job ativo para pausar', 'error');
+      return;
+    }
+    this.stoppingId = list.id;
+    this.api.patch(`/jobs/${list.latestJobId}/pause`, {}).subscribe({
+      next: () => {
+        this.stoppingId = null;
+        this.showToast(`Job "${list.name}" pausado`, 'success');
+        this.loadSearchLists();
+      },
+      error: (err) => {
+        this.stoppingId = null;
+        this.showToast('Erro ao pausar job: ' + (err.error?.title || err.message), 'error');
+        this.loadSearchLists();
       }
     });
   }

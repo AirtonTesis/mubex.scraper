@@ -1,9 +1,11 @@
 using Domain.Entities;
 using Domain.Validation;
+using Domain.ValueObjects;
 using Infrastructure.Persistence;
 using Infrastructure.Queue;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 
 namespace WebApi.Features.Jobs;
 
@@ -13,37 +15,52 @@ public class PauseJobHandler : IRequestHandler<PauseJobCommand, Result<bool>>
 {
     private readonly ApplicationDbContext _context;
     private readonly IQueueManager _queueManager;
+    private readonly ILogger<PauseJobHandler> _logger;
 
-    public PauseJobHandler(ApplicationDbContext context, IQueueManager queueManager)
+    public PauseJobHandler(ApplicationDbContext context, IQueueManager queueManager, ILogger<PauseJobHandler> logger)
     {
         _context = context;
         _queueManager = queueManager;
+        _logger = logger;
     }
 
     public async Task<Result<bool>> Handle(PauseJobCommand request, CancellationToken cancellationToken)
     {
-        var job = await _context.Jobs
-            .FirstOrDefaultAsync(j => j.Id == request.JobId, cancellationToken);
+        // Usar SQL direto para evitar DbUpdateConcurrencyException do EF Core
+        // (o ChangeTracker do EF Core conflita com o BackgroundWorker que modifica o mesmo job)
+        return await PauseWithDirectSqlAsync(request.JobId, cancellationToken);
+    }
 
-        if (job == null)
-            return Result<bool>.Failure(new List<ValidationKey>
-            {
-                ValidationKey.Custom("job", "id", "not_found")
-            });
+    private async Task<Result<bool>> PauseWithDirectSqlAsync(Guid jobId, CancellationToken cancellationToken)
+    {
+        // UPDATE direto na tabela Jobs — só afeta se o job ainda estiver Active
+        var affected = await _context.Database.ExecuteSqlRawAsync(
+            @"UPDATE ""Jobs"" 
+              SET ""Status"" = {0}, ""UpdatedAt"" = {1}
+              WHERE ""Id"" = {2} AND ""Status"" = {3}",
+            (int)JobStatus.Paused,
+            DateTime.UtcNow,
+            jobId,
+            (int)JobStatus.Active);
 
-        try
+        if (affected <= 0)
         {
-            job.Pause();
-            await _context.SaveChangesAsync(cancellationToken);
-            await _queueManager.UpdateJobStatusAsync(job.Id, job.Status, cancellationToken: cancellationToken);
+            _logger.LogInformation("Job {JobId} nao estava Active para pausar (ja foi processado).", jobId);
             return Result<bool>.Success(true);
         }
-        catch (InvalidOperationException ex)
-        {
-            return Result<bool>.Failure(new List<ValidationKey>
-            {
-                ValidationKey.Custom("job", "status", ex.Message)
-            });
-        }
+
+        // Inserir entrada no historico
+        await _context.Database.ExecuteSqlRawAsync(
+            @"INSERT INTO ""JobHistoryEntries"" (""Id"", ""JobId"", ""Status"", ""Timestamp"")
+              VALUES ({0}, {1}, {2}, {3})",
+            Guid.NewGuid(),
+            jobId,
+            (int)JobStatus.Paused,
+            DateTime.UtcNow);
+
+        await _queueManager.UpdateJobStatusAsync(jobId, JobStatus.Paused, cancellationToken: cancellationToken);
+
+        _logger.LogInformation("Job {JobId} pausado com sucesso via SQL direto.", jobId);
+        return Result<bool>.Success(true);
     }
 }
